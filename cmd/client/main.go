@@ -12,6 +12,7 @@ import (
 
 	"github.com/cg917658910/yc-pdf/libs/auth"
 
+	"github.com/jung-kurt/gofpdf"
 	api "github.com/pdfcpu/pdfcpu/pkg/api"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/types"
@@ -22,6 +23,7 @@ const activationSecret = "yc-pdf-trial-secret"
 func main() {
 	http.HandleFunc("/", indexHandler)
 	http.HandleFunc("/encrypt", encryptHandler)
+	http.HandleFunc("/verify", verifyHandler)
 
 	addr := ":8088"
 	log.Printf("listening on %s", addr)
@@ -156,7 +158,27 @@ func encryptHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	expiryLabel := expiryTime.Format("2006-01-02 15:04")
 
+	// 设置严格的PDF权限控制
 	conf := model.NewAESConfiguration(upw, opw, 256)
+
+	// 解析权限设置
+	printAllowed := r.FormValue("print") == "on"
+	copyAllowed := r.FormValue("copy") == "on"
+
+	// 设置PDF权限 - 使用pdfcpu的权限常量
+	// 根据pdfcpu文档，权限是16位值
+	// 默认使用最严格的权限设置
+	var permissions model.PermissionFlags = 0xF0C3 // PermissionsNone - 禁止所有操作
+
+	if printAllowed {
+		permissions = 0xF8C7 // PermissionsPrint - 允许打印
+	}
+
+	if printAllowed && copyAllowed {
+		permissions = 0xFFFF // PermissionsAll - 允许所有操作
+	}
+
+	conf.Permissions = permissions
 
 	// 将上传文件先写入临时文件
 	inTmp, err := os.CreateTemp("", "in-*.pdf")
@@ -177,8 +199,9 @@ func encryptHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 添加在线验证JavaScript - 增强保护
 	if err := embedCombinedJavaScript(inTmp.Name(), expiryDeadline, expiryLabel); err != nil {
-		http.Error(w, "写入脚本失败: "+err.Error(), http.StatusInternalServerError)
+		http.Error(w, "写入验证脚本失败: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -219,24 +242,112 @@ func encryptHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func embedCombinedJavaScript(pdfPath string, deadline time.Time, expiryLabel string) error {
-	ctx, err := api.ReadContextFile(pdfPath)
+	// 1. 读取原始 PDF 获取页数
+	origCtx, err := api.ReadContextFile(pdfPath)
 	if err != nil {
 		return fmt.Errorf("读取PDF失败: %w", err)
 	}
+	origPages := origCtx.PageCount
 
+	// 2. 生成错误页和过期页的临时 PDF（保证中文为 UTF-8）
+	//cwd, _ := os.Getwd()
+	/* fontPath := filepath.Join(cwd, "demo", "微软雅黑.ttf")
+	if _, err := os.Stat(fontPath); err != nil {
+		fontPath = "" // 如果不存在则留空，使用默认字体
+	} */
+	fontPath := "" // 如果不存在则留空，使用默认字体
+
+	errTmp, err := os.CreateTemp("", "err-*.pdf")
+	if err != nil {
+		return fmt.Errorf("创建临时错误页失败: %w", err)
+	}
+	errTmp.Close()
+	errTmpPath := errTmp.Name()
+	if err := createSinglePagePDF(errTmpPath, "文件显示错误！请使用Adobe Reader、PDF-XChange或福昕PDF阅读器打开当前文档！", fontPath); err != nil {
+		return fmt.Errorf("生成错误页失败: %w", err)
+	}
+
+	expTmp, err := os.CreateTemp("", "exp-*.pdf")
+	if err != nil {
+		return fmt.Errorf("创建临时过期页失败: %w", err)
+	}
+	expTmp.Close()
+	expTmpPath := expTmp.Name()
+	if err := createSinglePagePDF(expTmpPath, "您查看的文档已过期！\n\n请联系文档提供者获取最新版本。", fontPath); err != nil {
+		return fmt.Errorf("生成过期页失败: %w", err)
+	}
+
+	// 3. 合并为: 错误页 + 原始PDF + 过期页 -> mergedPath
+	mergedTmp, err := os.CreateTemp("", "merged-*.pdf")
+	if err != nil {
+		return fmt.Errorf("创建合并临时文件失败: %w", err)
+	}
+	mergedTmpPath := mergedTmp.Name()
+	mergedTmp.Close()
+
+	inFiles := []string{errTmpPath, pdfPath, expTmpPath}
+	// MergeCreateFile signature expects (inFiles []string, outFile string, useAcroForms bool, conf *model.Configuration)
+	if err := api.MergeCreateFile(inFiles, mergedTmpPath, false, nil); err != nil {
+		return fmt.Errorf("合并PDF失败: %w", err)
+	}
+
+	// 用合并后的文件替换原始 pdfPath
+	if err := os.Rename(mergedTmpPath, pdfPath); err != nil {
+		// 如果重命名失败，尝试复制
+		if in, err2 := os.Open(mergedTmpPath); err2 == nil {
+			if out, err3 := os.Create(pdfPath); err3 == nil {
+				if _, err4 := io.Copy(out, in); err4 != nil {
+					return fmt.Errorf("写入合并文件失败: %w", err4)
+				}
+				out.Close()
+			}
+			in.Close()
+		}
+	}
+
+	// 清理临时单页文件
+	os.Remove(errTmpPath)
+	os.Remove(expTmpPath)
+
+	// 4. 构造 OpenAction JS：支持的阅读器会跳到原始内容页或过期页
+	// 计算目标页索引（合并后：0=error, 1..origPages = original pages, origPages+1 = expired page）
+	normalIndex := 1
+	expiredIndex := 1 + origPages
+	d := deadline.UTC().Format(time.RFC3339)
+
+	script := fmt.Sprintf(`try {
+  var viewer = (app.viewerType || '').toString().toLowerCase();
+  var disp = (app.viewerDisplayName || '').toString().toLowerCase();
+  var ok = false;
+  if (viewer.indexOf('reader') !== -1 || viewer.indexOf('acrobat') !== -1) ok = true;
+  if (viewer.indexOf('foxit') !== -1 || disp.indexOf('foxit') !== -1) ok = true;
+  if (viewer.indexOf('pdf-xchange') !== -1 || disp.indexOf('pdf-xchange') !== -1 || disp.indexOf('pdfxchange') !== -1) ok = true;
+  var expiryDeadline = new Date("%s");
+  var now = new Date();
+  if (ok) {
+    if (now.getTime() < expiryDeadline.getTime()) {
+      try { this.pageNum = %d; } catch(e) {}
+    } else {
+      try { this.pageNum = %d; } catch(e) {}
+    }
+  }
+} catch (e) {}
+`, d, normalIndex, expiredIndex)
+
+	// 写入 OpenAction 到合并后的PDF
+	ctx, err := api.ReadContextFile(pdfPath)
+	if err != nil {
+		return fmt.Errorf("读取合并后PDF失败: %w", err)
+	}
 	rootDict, err := ctx.Catalog()
 	if err != nil {
 		return fmt.Errorf("读取PDF目录失败: %w", err)
 	}
-
-	// 将查看器检查脚本和过期脚本合并为一个 OpenAction，保证两个脚本都会执行
-	script := buildViewerCheckScript() + "\n" + buildExpiryScript(deadline, expiryLabel)
 	actionDict := types.Dict(map[string]types.Object{
 		"S":  types.Name("JavaScript"),
 		"JS": types.StringLiteral(script),
 	})
 	rootDict.Insert("OpenAction", actionDict)
-
 	req := types.Dict(map[string]types.Object{
 		"Type": types.Name("Requirement"),
 		"S":    types.Name("EnableJavaScripts"),
@@ -246,37 +357,119 @@ func embedCombinedJavaScript(pdfPath string, deadline time.Time, expiryLabel str
 	if err := api.WriteContextFile(ctx, pdfPath); err != nil {
 		return fmt.Errorf("写入PDF失败: %w", err)
 	}
+
 	return nil
 }
 
+// createSinglePagePDF 使用 gofpdf 创建仅包含一页居中文本的 PDF（支持 UTF-8 字体路径）
+func createSinglePagePDF(path, text, fontPath string) error {
+	pdf := gofpdf.New("P", "mm", "A4", "")
+	if fontPath != "" {
+		pdf.AddUTF8Font("zh", "", fontPath)
+		pdf.SetFont("zh", "", 20)
+	} else {
+		pdf.SetFont("Arial", "", 20)
+	}
+	pdf.AddPage()
+	pdf.MultiCell(0, 12, text, "", "C", false)
+	return pdf.OutputFileAndClose(path)
+}
+
 func buildViewerCheckScript() string {
-	// 脚本在打开时运行，检测 app.viewerType / app.viewerDisplayName
+	// 更严格的PDF阅读器检查脚本
 	return `try {
   var ok = false;
-  var viewer = (app.viewerType || '').toString().toLowerCase();
-  var disp = (app.viewerDisplayName || '').toString().toLowerCase();
-
-  if (viewer.indexOf('reader') !== -1 || viewer.indexOf('acrobat') !== -1) ok = true;
-  if (viewer.indexOf('foxit') !== -1 || disp.indexOf('foxit') !== -1) ok = true;
-  if (viewer.indexOf('pdf-xchange') !== -1 || disp.indexOf('pdf-xchange') !== -1 || disp.indexOf('pdfxchange') !== -1) ok = true;
-
-  if (!ok) {
-    app.alert('显示错误！请使用Adobe Reader、PDF-XChange或福昕PDF阅读器打开当前文档！', 3);
-    try { this.closeDoc(true); } catch (e) {}
+  var viewer = '';
+  var disp = '';
+  var appInfo = '';
+  
+  // 多重检查方式
+  try { viewer = (app.viewerType || '').toString().toLowerCase(); } catch(e) {}
+  try { disp = (app.viewerDisplayName || '').toString().toLowerCase(); } catch(e) {}
+  try { appInfo = (app.appInfo || {}).appName || ''; appInfo = appInfo.toString().toLowerCase(); } catch(e) {}
+  
+  // 检查Adobe Reader/Acrobat
+  if (viewer.indexOf('reader') !== -1 || viewer.indexOf('acrobat') !== -1 || 
+      disp.indexOf('reader') !== -1 || disp.indexOf('acrobat') !== -1 ||
+      appInfo.indexOf('reader') !== -1 || appInfo.indexOf('acrobat') !== -1) {
+    ok = true;
   }
-} catch (e) {}
+  
+  // 检查Foxit
+  if (viewer.indexOf('foxit') !== -1 || disp.indexOf('foxit') !== -1 || 
+      appInfo.indexOf('foxit') !== -1) {
+    ok = true;
+  }
+  
+  // 检查PDF-XChange
+  if (viewer.indexOf('pdf-xchange') !== -1 || disp.indexOf('pdf-xchange') !== -1 || 
+      disp.indexOf('pdfxchange') !== -1 || appInfo.indexOf('pdf-xchange') !== -1 ||
+      appInfo.indexOf('pdfxchange') !== -1) {
+    ok = true;
+  }
+  
+  // 如果所有检查都失败，说明不是支持的阅读器
+  if (!ok) {
+    // 显示错误并阻止继续阅读
+    app.alert('显示错误！请使用Adobe Reader、PDF-XChange或福昕PDF阅读器打开当前文档！', 3);
+    
+    // 尝试多种方式关闭文档
+    try { this.closeDoc(true); } catch (e) {}
+    try { this.doc.closeDoc(true); } catch (e) {}
+    try { app.execMenuItem('Close'); } catch (e) {}
+    
+    // 如果无法关闭，覆盖所有页面内容
+    try {
+      for (var i = 0; i < this.numPages; i++) {
+        var r = this.getPageBox("Crop", i);
+        this.addAnnot({
+          page: i,
+          type: "FreeText",
+          rect: [r[0], r[1], r[2], r[3]],
+          contents: "显示错误！\\n\\n请使用Adobe Reader、PDF-XChange或福昕PDF阅读器打开当前文档！",
+          textFont: "Helv",
+          textSize: 24,
+          alignment: 1,
+          fillColor: color.white,
+          textColor: color.red,
+          opacity: 1
+        });
+      }
+    } catch (e) {}
+  }
+} catch (e) {
+  // 如果脚本执行出错，也显示错误
+  try {
+    app.alert('显示错误！请使用Adobe Reader、PDF-XChange或福昕PDF阅读器打开当前文档！', 3);
+  } catch (err) {}
+}
 `
 }
 
 func buildExpiryScript(deadline time.Time, label string) string {
 	d := deadline.UTC().Format(time.RFC3339)
-	return fmt.Sprintf(`var expiryDeadline = new Date("%s");
+	return fmt.Sprintf(`// 过期检查脚本
+var expiryDeadline = new Date("%s");
+var expiryLabel = "%s";
 var now = new Date();
-if (now.getTime() >= expiryDeadline.getTime()) {
-  try { app.alert("您查看的文档已过期！", 3); } catch (e) {}
+
+// 显示过期信息
+function showExpired() {
+  try { 
+    app.alert("您查看的文档已过期！\\n过期时间: " + expiryLabel, 3); 
+  } catch (e) {}
+  
+  // 尝试关闭文档
+  try { this.closeDoc(true); } catch (e) {}
+  try { this.doc.closeDoc(true); } catch (e) {}
+  try { app.execMenuItem('Close'); } catch (e) {}
+  
+  // 如果无法关闭，覆盖所有页面内容
   try {
     for (var i = 0; i < this.numPages; i++) {
       var r = this.getPageBox("Crop", i);
+      
+      // 清除现有注释
       try {
         var annots = this.getAnnots({nPage: i});
         if (annots) {
@@ -285,14 +478,16 @@ if (now.getTime() >= expiryDeadline.getTime()) {
           }
         }
       } catch (e) {}
+      
+      // 添加过期覆盖层
       try {
         this.addAnnot({
           page: i,
           type: "FreeText",
           rect: [r[0], r[1], r[2], r[3]],
-          contents: "您查看的文档已过期！",
+          contents: "您查看的文档已过期！\\n\\n过期时间: " + expiryLabel + "\\n\\n请联系文档提供者获取最新版本。",
           textFont: "Helv",
-          textSize: 36,
+          textSize: 32,
           alignment: 1,
           fillColor: color.white,
           textColor: color.red,
@@ -300,6 +495,22 @@ if (now.getTime() >= expiryDeadline.getTime()) {
         });
       } catch (e) {}
     }
+  } catch (e) {}
+}
+
+// 检查是否过期
+if (now.getTime() >= expiryDeadline.getTime()) {
+  showExpired();
+} else {
+  // 如果未过期，设置定时器每分钟检查一次
+  try {
+    var checkInterval = setInterval(function() {
+      var current = new Date();
+      if (current.getTime() >= expiryDeadline.getTime()) {
+        clearInterval(checkInterval);
+        showExpired();
+      }
+    }, 60000); // 每分钟检查一次
   } catch (e) {}
 }
 `, d, label)
@@ -328,6 +539,46 @@ func parseExpiry(input string) (time.Time, error) {
 
 func generateMachineCode() (string, error) {
 	return auth.GetMachineCode()
+}
+
+func verifyHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("收到验证请求: IP=%s, 时间=%s",
+		r.RemoteAddr,
+		time.Now().Format("2006-01-02 15:04:05"))
+	// 获取查询参数
+	machineCode := r.URL.Query().Get("machine")
+	if machineCode == "" {
+		http.Error(w, "INVALID", http.StatusBadRequest)
+		return
+	}
+
+	// 验证机器码是否在允许列表中
+	// 这里可以连接数据库或其他验证机制
+	// 目前简单检查机器码格式
+
+	// 记录验证日志
+	log.Printf("验证请求: 机器码=%s, IP=%s, 时间=%s",
+		machineCode,
+		r.RemoteAddr,
+		time.Now().Format("2006-01-02 15:04:05"))
+
+	// 简单验证逻辑 - 在实际应用中应该更复杂
+	if len(machineCode) >= 10 && len(machineCode) <= 50 {
+		// 可以添加更多验证逻辑，如：
+		// 1. 检查机器码是否在数据库中
+		// 2. 检查是否过期
+		// 3. 检查使用次数等
+
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "VALID")
+		log.Printf("验证成功: 机器码=%s", machineCode)
+	} else {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, "INVALID")
+		log.Printf("验证失败: 机器码=%s (格式无效)", machineCode)
+	}
 }
 
 func validateActivationCode(machineCode, activation string) bool {
